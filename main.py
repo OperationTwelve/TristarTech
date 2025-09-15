@@ -14,9 +14,10 @@ VERIFY_URL = "https://esi.evetech.net/verify/"
 LOCATION_URL = "https://esi.evetech.net/latest/characters/{character_id}/location/"
 
 # Your EVE developer app credentials
-CLIENT_ID = "4468a9c3580345e78433cb1622fd1616"
-CLIENT_SECRET = "eat_1xjey6dISq4WHUxYHkbJvbx0o5Mbw27yS_2L8nYf"
-REDIRECT_URI = "https://your-app-url/callback"  # Replace with your app's callback URL
+CLIENT_ID = os.environ.get('CLIENT_ID')
+CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
+REDIRECT_URI = os.environ.get('REDIRECT_URI', 'https://tristartech.onrender.com/callback')
+
 SCOPES = "esi-location.read_location.v1"
 
 def log_location(location):

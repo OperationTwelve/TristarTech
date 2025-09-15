@@ -23,7 +23,7 @@ CLIENT_ID = os.environ.get('CLIENT_ID')
 CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
 REDIRECT_URI = os.environ.get('REDIRECT_URI')
 
-# In-memory storage for user data and location history
+# In-memory storage
 USERS = {}  # {character_id: {'character_name': str, 'portrait_url': str, 'access_token': str}}
 LOCATION_HISTORY = []  # [{'character_id': int, 'system_id': int, 'system_name': str, ...}]
 UPDATE_FREQUENCY = int(os.environ.get('UPDATE_FREQUENCY', 60))
@@ -136,9 +136,9 @@ def home():
     <html>
     <head>
         <title>EVE Location Logger</title>
-        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH" crossorigin="anonymous">
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="anonymous" />
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin="anonymous"></script>
         <style>
             #map { height: 400px; }
             .navbar-brand img { width: 32px; height: 32px; margin-right: 10px; }
@@ -156,15 +156,15 @@ def home():
                 <a class="navbar-brand" href="/">EVE Location Logger</a>
                 {% endif %}
                 <div class="collapse navbar-collapse">
-                    <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+                    <ul class="nav nav-tabs me-auto mb-2 mb-lg-0">
                         <li class="nav-item">
-                            <a class="nav-link active" href="#overview" data-bs-toggle="tab">Overview</a>
+                            <a class="nav-link active" href="#overview" data-bs-toggle="tab" role="tab">Overview</a>
                         </li>
                         <li class="nav-item">
-                            <a class="nav-link" href="#history" data-bs-toggle="tab">Location History</a>
+                            <a class="nav-link" href="#history" data-bs-toggle="tab" role="tab">Location History</a>
                         </li>
                         <li class="nav-item">
-                            <a class="nav-link" href="#settings" data-bs-toggle="tab">Settings</a>
+                            <a class="nav-link" href="#settings" data-bs-toggle="tab" role="tab">Settings</a>
                         </li>
                     </ul>
                     {% if not character_name %}
@@ -175,7 +175,7 @@ def home():
         </nav>
         <div class="container mt-4">
             <div class="tab-content">
-                <div class="tab-pane fade show active" id="overview">
+                <div class="tab-pane fade show active" id="overview" role="tabpanel">
                     <h3>Overview</h3>
                     {% if location %}
                     <p>Current Location: {{ location }}</p>
@@ -183,7 +183,7 @@ def home():
                     <p>Please log in to view your current location.</p>
                     {% endif %}
                 </div>
-                <div class="tab-pane fade" id="history">
+                <div class="tab-pane fade" id="history" role="tabpanel">
                     <h3>Location History</h3>
                     <div id="map"></div>
                     <ul>
@@ -195,7 +195,7 @@ def home():
                     {% endfor %}
                     </ul>
                 </div>
-                <div class="tab-pane fade" id="settings">
+                <div class="tab-pane fade" id="settings" role="tabpanel">
                     <h3>Settings</h3>
                     <form method="POST" action="/update_settings">
                         <div class="mb-3">
@@ -207,8 +207,17 @@ def home():
                 </div>
             </div>
         </div>
-        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>
         <script>
+            console.log('Bootstrap script loaded');
+            document.addEventListener('DOMContentLoaded', function() {
+                try {
+                    var tabs = new bootstrap.Tab(document.querySelector('.nav-tabs .nav-link.active'));
+                    console.log('Tabs initialized');
+                } catch (e) {
+                    console.error('Error initializing tabs:', e);
+                }
+            });
             var map = L.map('map').setView([0, 0], 2);
             L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
                 attribution: 'EVE Map'
@@ -267,7 +276,6 @@ def callback():
     if not character_id:
         return "Error verifying character", 400
 
-    # Store user data in memory
     USERS[character_id] = {
         'character_name': character_name,
         'portrait_url': portrait_url,

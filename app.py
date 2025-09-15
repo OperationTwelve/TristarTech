@@ -3,7 +3,6 @@ from flask import Flask, redirect, request, render_template_string, session
 import requests
 import urllib.parse
 from datetime import datetime, timezone, timedelta
-import sqlite3
 import threading
 import time
 
@@ -24,27 +23,10 @@ CLIENT_ID = os.environ.get('CLIENT_ID')
 CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
 REDIRECT_URI = os.environ.get('REDIRECT_URI')
 
-# SQLite database setup
-def init_db():
-    with sqlite3.connect('locations.db') as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS locations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                character_id INTEGER,
-                system_id INTEGER,
-                system_name TEXT,
-                is_wormhole BOOLEAN,
-                station_id INTEGER,
-                structure_id INTEGER,
-                timestamp DATETIME
-            )
-        ''')
-        conn.commit()
-
-init_db()
-
-# Global variable for update frequency (seconds)
-UPDATE_FREQUENCY = int(os.environ.get('UPDATE_FREQUENCY', 60))  # Default 60 seconds
+# In-memory storage for user data and location history
+USERS = {}  # {character_id: {'character_name': str, 'portrait_url': str, 'access_token': str}}
+LOCATION_HISTORY = []  # [{'character_id': int, 'system_id': int, 'system_name': str, ...}]
+UPDATE_FREQUENCY = int(os.environ.get('UPDATE_FREQUENCY', 60))
 
 def get_access_token(code):
     payload = {"grant_type": "authorization_code", "code": code}
@@ -95,6 +77,7 @@ def get_location(character_id, access_token):
         system_id = data['solar_system_id']
         system_name, is_wormhole = get_system_info(system_id)
         location = {
+            'character_id': character_id,
             'system_id': system_id,
             'system_name': system_name,
             'is_wormhole': is_wormhole,
@@ -108,50 +91,32 @@ def get_location(character_id, access_token):
 
 def log_location(character_id, location):
     if location:
-        with sqlite3.connect('locations.db') as conn:
-            conn.execute('''
-                INSERT INTO locations (character_id, system_id, system_name, is_wormhole, station_id, structure_id, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                character_id,
-                location['system_id'],
-                location['system_name'],
-                location['is_wormhole'],
-                location['station_id'],
-                location['structure_id'],
-                location['timestamp']
-            ))
-            conn.commit()
+        LOCATION_HISTORY.append(location)
 
 def get_location_history(character_id):
-    with sqlite3.connect('locations.db') as conn:
-        cursor = conn.execute('SELECT system_id, system_name, is_wormhole, station_id, structure_id, timestamp FROM locations WHERE character_id = ? ORDER BY timestamp DESC', (character_id,))
-        history = [
-            {
-                'system_id': row[0],
-                'system_name': row[1],
-                'is_wormhole': row[2],
-                'station_id': row[3],
-                'structure_id': row[4],
-                'timestamp': datetime.fromisoformat(row[5].replace('Z', '+00:00')),
-                'color': 'green' if row[2] else (
-                    'yellow' if (datetime.now(timezone.utc) - datetime.fromisoformat(row[5].replace('Z', '+00:00'))).total_seconds() < 24*3600 else
-                    'red' if (datetime.now(timezone.utc) - datetime.fromisoformat(row[5].replace('Z', '+00:00'))).total_seconds() >= 48*3600 else 'blue'
-                )
-            } for row in cursor.fetchall()
-        ]
-        return history
+    history = [
+        {
+            'system_id': entry['system_id'],
+            'system_name': entry['system_name'],
+            'is_wormhole': entry['is_wormhole'],
+            'station_id': entry['station_id'],
+            'structure_id': entry['structure_id'],
+            'timestamp': entry['timestamp'],
+            'color': 'green' if entry['is_wormhole'] else (
+                'yellow' if (datetime.now(timezone.utc) - entry['timestamp']).total_seconds() < 24*3600 else
+                'red' if (datetime.now(timezone.utc) - entry['timestamp']).total_seconds() >= 48*3600 else 'blue'
+            )
+        } for entry in LOCATION_HISTORY if entry['character_id'] == character_id
+    ]
+    return history
 
 def background_location_update():
     while True:
-        if 'character_id' in session and 'access_token' in session:
-            location = get_location(session['character_id'], session['access_token'])
+        for character_id, user_data in USERS.items():
+            access_token = user_data.get('access_token')
+            location = get_location(character_id, access_token)
             if location:
-                log_location(session['character_id'], location)
-                session['location'] = f"{location['system_name']} (ID: {location['system_id']})" + (
-                    f", Station ID: {location['station_id']}" if location['station_id'] else
-                    f", Structure ID: {location['structure_id']}" if location['structure_id'] else ""
-                )
+                log_location(character_id, location)
         time.sleep(UPDATE_FREQUENCY)
 
 # Start background thread
@@ -159,10 +124,11 @@ threading.Thread(target=background_location_update, daemon=True).start()
 
 @app.route('/')
 def home():
-    character_name = session.get('character_name', None)
-    portrait_url = session.get('portrait_url', None)
+    character_id = session.get('character_id')
+    character_name = USERS.get(character_id, {}).get('character_name') if character_id else None
+    portrait_url = USERS.get(character_id, {}).get('portrait_url') if character_id else None
     location = session.get('location', None)
-    history = get_location_history(session.get('character_id', 0)) if 'character_id' in session else []
+    history = get_location_history(character_id) if character_id else []
     update_frequency = UPDATE_FREQUENCY
 
     html = """
@@ -250,7 +216,7 @@ def home():
             var locations = [
                 {% for entry in history %}
                 {
-                    lat: {{ loop.index * 10 - 50 }},  // Simplified: spread systems on map
+                    lat: {{ loop.index * 10 - 50 }},
                     lng: {{ loop.index * 10 - 50 }},
                     name: "{{ entry.system_name }}",
                     color: "{{ entry.color }}"
@@ -264,7 +230,9 @@ def home():
                     fillOpacity: 0.8
                 }).addTo(map).bindPopup(loc.name);
             });
-            map.fitBounds(locations.map(l => [l.lat, l.lng]));
+            if (locations.length > 0) {
+                map.fitBounds(locations.map(l => [l.lat, l.lng]));
+            }
         </script>
     </body>
     </html>
@@ -299,10 +267,16 @@ def callback():
     if not character_id:
         return "Error verifying character", 400
 
+    # Store user data in memory
+    USERS[character_id] = {
+        'character_name': character_name,
+        'portrait_url': portrait_url,
+        'access_token': access_token
+    }
+
     session['character_id'] = character_id
     session['character_name'] = character_name
     session['portrait_url'] = portrait_url
-    session['access_token'] = access_token
 
     location = get_location(character_id, access_token)
     if location:
@@ -319,7 +293,7 @@ def update_settings():
     try:
         UPDATE_FREQUENCY = int(request.form.get('update_frequency', 60))
         if UPDATE_FREQUENCY < 10:
-            UPDATE_FREQUENCY = 10  # Minimum 10 seconds
+            UPDATE_FREQUENCY = 10
     except ValueError:
         pass
     return redirect('/')

@@ -1,47 +1,86 @@
+import os
 from flask import Flask, redirect, request, render_template_string, session
 import requests
 import urllib.parse
-from datetime import datetime, timezone
-import os
+from datetime import datetime, timezone, timedelta
+import sqlite3
+import threading
+import time
 
 app = Flask(__name__)
-app.secret_key = os.environ.get('SECRET_KEY')  # Must be set in Render
+app.secret_key = os.environ.get('SECRET_KEY', os.urandom(24))
 
-# EVE Online OAuth endpoints
+# EVE Online OAuth and API endpoints
 AUTH_URL = "https://login.eveonline.com/v2/oauth/authorize"
 TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
 VERIFY_URL = "https://esi.evetech.net/verify/"
 LOCATION_URL = "https://esi.evetech.net/latest/characters/{character_id}/location/"
+SYSTEM_URL = "https://esi.evetech.net/latest/universe/systems/{system_id}/"
+CHARACTER_URL = "https://esi.evetech.net/latest/characters/{character_id}/"
+PORTRAIT_URL = "https://esi.evetech.net/latest/characters/{character_id}/portrait/"
 
-# Scopes needed
 SCOPES = "esi-location.read_location.v1"
-
-# Get from env vars (set in Render dashboard)
 CLIENT_ID = os.environ.get('CLIENT_ID')
 CLIENT_SECRET = os.environ.get('CLIENT_SECRET')
 REDIRECT_URI = os.environ.get('REDIRECT_URI')
 
+# SQLite database setup
+def init_db():
+    with sqlite3.connect('locations.db') as conn:
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS locations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                character_id INTEGER,
+                system_id INTEGER,
+                system_name TEXT,
+                is_wormhole BOOLEAN,
+                station_id INTEGER,
+                structure_id INTEGER,
+                timestamp DATETIME
+            )
+        ''')
+        conn.commit()
+
+init_db()
+
+# Global variable for update frequency (seconds)
+UPDATE_FREQUENCY = int(os.environ.get('UPDATE_FREQUENCY', 60))  # Default 60 seconds
+
 def get_access_token(code):
-    payload = {
-        "grant_type": "authorization_code",
-        "code": code
-    }
+    payload = {"grant_type": "authorization_code", "code": code}
     auth = (CLIENT_ID, CLIENT_SECRET)
     try:
         response = requests.post(TOKEN_URL, data=payload, auth=auth)
         response.raise_for_status()
         return response.json().get('access_token')
-    except requests.RequestException as e:
-        return None  # Handle in caller
+    except requests.RequestException:
+        return None
 
-def get_character_id(access_token):
+def get_character_info(access_token):
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
         response = requests.get(VERIFY_URL, headers=headers)
         response.raise_for_status()
-        return response.json().get('CharacterID')
-    except requests.RequestException as e:
-        return None
+        char_data = response.json()
+        character_id = char_data.get('CharacterID')
+        character_name = char_data.get('CharacterName')
+        portrait_response = requests.get(PORTRAIT_URL.format(character_id=character_id))
+        portrait_response.raise_for_status()
+        portrait_url = portrait_response.json().get('px128x128', '')
+        return character_id, character_name, portrait_url
+    except requests.RequestException:
+        return None, None, None
+
+def get_system_info(system_id):
+    try:
+        response = requests.get(SYSTEM_URL.format(system_id=system_id))
+        response.raise_for_status()
+        data = response.json()
+        system_name = data.get('name', 'Unknown')
+        is_wormhole = data.get('security_class') == 'W'
+        return system_name, is_wormhole
+    except requests.RequestException:
+        return 'Unknown', False
 
 def get_location(character_id, access_token):
     headers = {
@@ -49,46 +88,193 @@ def get_location(character_id, access_token):
         "X-Compatibility-Date": "2025-08-26",
         "X-Tenant": "tranquility"
     }
-    url = LOCATION_URL.format(character_id=character_id)
     try:
-        response = requests.get(url, headers=headers)
+        response = requests.get(LOCATION_URL.format(character_id=character_id), headers=headers)
         response.raise_for_status()
         data = response.json()
-        location = f"Solar System ID: {data['solar_system_id']}"
-        if 'station_id' in data:
-            location += f", Station ID: {data['station_id']}"
-        elif 'structure_id' in data:
-            location += f", Structure ID: {data['structure_id']}"
+        system_id = data['solar_system_id']
+        system_name, is_wormhole = get_system_info(system_id)
+        location = {
+            'system_id': system_id,
+            'system_name': system_name,
+            'is_wormhole': is_wormhole,
+            'station_id': data.get('station_id'),
+            'structure_id': data.get('structure_id'),
+            'timestamp': datetime.now(timezone.utc)
+        }
         return location
-    except requests.RequestException as e:
-        return "Unknown"
+    except requests.RequestException:
+        return None
 
-def log_location(location):
-    with open("eve_location_log.txt", "a") as f:
-        f.write(f"{datetime.now(timezone.utc)}: {location}\n")
+def log_location(character_id, location):
+    if location:
+        with sqlite3.connect('locations.db') as conn:
+            conn.execute('''
+                INSERT INTO locations (character_id, system_id, system_name, is_wormhole, station_id, structure_id, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                character_id,
+                location['system_id'],
+                location['system_name'],
+                location['is_wormhole'],
+                location['station_id'],
+                location['structure_id'],
+                location['timestamp']
+            ))
+            conn.commit()
+
+def get_location_history(character_id):
+    with sqlite3.connect('locations.db') as conn:
+        cursor = conn.execute('SELECT system_id, system_name, is_wormhole, station_id, structure_id, timestamp FROM locations WHERE character_id = ? ORDER BY timestamp DESC', (character_id,))
+        history = [
+            {
+                'system_id': row[0],
+                'system_name': row[1],
+                'is_wormhole': row[2],
+                'station_id': row[3],
+                'structure_id': row[4],
+                'timestamp': datetime.fromisoformat(row[5].replace('Z', '+00:00')),
+                'color': 'green' if row[2] else (
+                    'yellow' if (datetime.now(timezone.utc) - datetime.fromisoformat(row[5].replace('Z', '+00:00'))).total_seconds() < 24*3600 else
+                    'red' if (datetime.now(timezone.utc) - datetime.fromisoformat(row[5].replace('Z', '+00:00'))).total_seconds() >= 48*3600 else 'blue'
+                )
+            } for row in cursor.fetchall()
+        ]
+        return history
+
+def background_location_update():
+    while True:
+        if 'character_id' in session and 'access_token' in session:
+            location = get_location(session['character_id'], session['access_token'])
+            if location:
+                log_location(session['character_id'], location)
+                session['location'] = f"{location['system_name']} (ID: {location['system_id']})" + (
+                    f", Station ID: {location['station_id']}" if location['station_id'] else
+                    f", Structure ID: {location['structure_id']}" if location['structure_id'] else ""
+                )
+        time.sleep(UPDATE_FREQUENCY)
+
+# Start background thread
+threading.Thread(target=background_location_update, daemon=True).start()
 
 @app.route('/')
 def home():
+    character_name = session.get('character_name', None)
+    portrait_url = session.get('portrait_url', None)
+    location = session.get('location', None)
+    history = get_location_history(session.get('character_id', 0)) if 'character_id' in session else []
+    update_frequency = UPDATE_FREQUENCY
+
     html = """
     <!DOCTYPE html>
     <html>
-    <head><title>EVE Location Logger</title></head>
+    <head>
+        <title>EVE Location Logger</title>
+        <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <style>
+            #map { height: 400px; }
+            .navbar-brand img { width: 32px; height: 32px; margin-right: 10px; }
+        </style>
+    </head>
     <body>
-        <h2>EVE Online Location Logger</h2>
-        <p>Log in to track your character's location.</p>
-        <a href="/login"><button>Log In</button></a>
-        {% if location %}
-        <h3>Current Location: {{ location }}</h3>
-        {% endif %}
+        <nav class="navbar navbar-expand-lg navbar-light bg-light">
+            <div class="container-fluid">
+                {% if character_name %}
+                <a class="navbar-brand" href="/">
+                    <img src="{{ portrait_url }}" alt="Portrait">
+                    {{ character_name }}
+                </a>
+                {% else %}
+                <a class="navbar-brand" href="/">EVE Location Logger</a>
+                {% endif %}
+                <div class="collapse navbar-collapse">
+                    <ul class="navbar-nav me-auto mb-2 mb-lg-0">
+                        <li class="nav-item">
+                            <a class="nav-link active" href="#overview" data-bs-toggle="tab">Overview</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="#history" data-bs-toggle="tab">Location History</a>
+                        </li>
+                        <li class="nav-item">
+                            <a class="nav-link" href="#settings" data-bs-toggle="tab">Settings</a>
+                        </li>
+                    </ul>
+                    {% if not character_name %}
+                    <a href="/login" class="btn btn-primary">Log In</a>
+                    {% endif %}
+                </div>
+            </div>
+        </nav>
+        <div class="container mt-4">
+            <div class="tab-content">
+                <div class="tab-pane fade show active" id="overview">
+                    <h3>Overview</h3>
+                    {% if location %}
+                    <p>Current Location: {{ location }}</p>
+                    {% else %}
+                    <p>Please log in to view your current location.</p>
+                    {% endif %}
+                </div>
+                <div class="tab-pane fade" id="history">
+                    <h3>Location History</h3>
+                    <div id="map"></div>
+                    <ul>
+                    {% for entry in history %}
+                    <li>{{ entry.timestamp }}: {{ entry.system_name }} (ID: {{ entry.system_id }})
+                        {% if entry.station_id %}Station ID: {{ entry.station_id }}{% elif entry.structure_id %}Structure ID: {{ entry.structure_id }}{% endif %}
+                        (Color: {{ entry.color }})
+                    </li>
+                    {% endfor %}
+                    </ul>
+                </div>
+                <div class="tab-pane fade" id="settings">
+                    <h3>Settings</h3>
+                    <form method="POST" action="/update_settings">
+                        <div class="mb-3">
+                            <label for="update_frequency" class="form-label">Location Update Frequency (seconds):</label>
+                            <input type="number" class="form-control" id="update_frequency" name="update_frequency" value="{{ update_frequency }}" min="10">
+                        </div>
+                        <button type="submit" class="btn btn-primary">Save</button>
+                    </form>
+                </div>
+            </div>
+        </div>
+        <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+        <script>
+            var map = L.map('map').setView([0, 0], 2);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: 'EVE Map'
+            }).addTo(map);
+            var locations = [
+                {% for entry in history %}
+                {
+                    lat: {{ loop.index * 10 - 50 }},  // Simplified: spread systems on map
+                    lng: {{ loop.index * 10 - 50 }},
+                    name: "{{ entry.system_name }}",
+                    color: "{{ entry.color }}"
+                },
+                {% endfor %}
+            ];
+            locations.forEach(function(loc) {
+                L.circleMarker([loc.lat, loc.lng], {
+                    radius: 8,
+                    color: loc.color,
+                    fillOpacity: 0.8
+                }).addTo(map).bindPopup(loc.name);
+            });
+            map.fitBounds(locations.map(l => [l.lat, l.lng]));
+        </script>
     </body>
     </html>
     """
-    return render_template_string(html, location=session.get('location', None))
+    return render_template_string(html, character_name=character_name, portrait_url=portrait_url, location=location, history=history, update_frequency=update_frequency)
 
 @app.route('/login')
 def login():
     if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
-        return "Error: Missing CLIENT_ID, CLIENT_SECRET, or REDIRECT_URI environment variables", 500
+        return "Error: CLIENT_ID, CLIENT_SECRET, or REDIRECT_URI not set", 500
     params = {
         "response_type": "code",
         "redirect_uri": REDIRECT_URI,
@@ -109,15 +295,35 @@ def callback():
     if not access_token:
         return "Error getting access token", 400
 
-    character_id = get_character_id(access_token)
+    character_id, character_name, portrait_url = get_character_info(access_token)
     if not character_id:
         return "Error verifying character", 400
 
+    session['character_id'] = character_id
+    session['character_name'] = character_name
+    session['portrait_url'] = portrait_url
+    session['access_token'] = access_token
+
     location = get_location(character_id, access_token)
-    log_location(location)
-    session['location'] = location
+    if location:
+        log_location(character_id, location)
+        session['location'] = f"{location['system_name']} (ID: {location['system_id']})" + (
+            f", Station ID: {location['station_id']}" if location['station_id'] else
+            f", Structure ID: {location['structure_id']}" if location['structure_id'] else ""
+        )
+    return redirect('/')
+
+@app.route('/update_settings', methods=['POST'])
+def update_settings():
+    global UPDATE_FREQUENCY
+    try:
+        UPDATE_FREQUENCY = int(request.form.get('update_frequency', 60))
+        if UPDATE_FREQUENCY < 10:
+            UPDATE_FREQUENCY = 10  # Minimum 10 seconds
+    except ValueError:
+        pass
     return redirect('/')
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
+    port = int(os.environ.get('PORT', 10000))
     app.run(host='0.0.0.0', port=port, debug=False)
